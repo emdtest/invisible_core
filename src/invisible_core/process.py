@@ -1216,23 +1216,60 @@ class Reaper(threading.Thread):
         self._lock = threading.Lock()
         self._steps: List[Any] = []
         self._finished = False
+        # The steps handed over after the reaping was over: they run on a thread of their own (a continuation), never on
+        # the thread of whoever hands them over. `_tail` is their queue, `_cont` the thread that is running them (None
+        # when there is none).
+        self._tail: List[Any] = []
+        self._cont: Optional[threading.Thread] = None
 
     @property
     def finished(self) -> bool:
-        """Whether the tree is ended and every step has run."""
-        return self._finished
+        """Whether the tree is ended and every step has run, those handed over after the reaping was over included."""
+        with self._lock:
+            return self._finished and self._cont is None
 
     def then(self, step: Any) -> None:
-        """Run `step()` once the tree is gone: by this thread when it is still working, at once by the caller when it
-        has finished. Never raises."""
+        """Run `step()` once the tree is gone, ALWAYS on a thread of this reaper and never on the caller's: by the
+        reaper's own thread while it is still working, by a continuation of it (a thread that is not a daemon, one at
+        a time, in the order of the hand-over) when it has finished. `join()`, `finished` and the end of the
+        interpreter cover the continuation too. Never raises.
+
+        The only case where the caller runs the step is a thread that cannot be created any more (the end of the
+        interpreter: `RuntimeError` from `Thread.start`): there is no other thread to give it to, and the step is run
+        rather than lost."""
         with self._lock:
             if not self._finished:
                 self._steps.append(step)
                 return
+            self._tail.append(step)
+            if self._cont is not None:        # a continuation is running: it takes this step after the earlier ones
+                return
+            cont = threading.Thread(target=self._continue, name="invisible-reaper-then", daemon=False)
+            self._cont = cont
+            try:
+                cont.start()
+                return
+            except RuntimeError:              # no thread can be made: the step is the caller's
+                self._cont = None
+                self._tail.remove(step)
         try:
             step()
         except Exception:
             pass
+
+    def _continue(self) -> None:
+        """The continuation: takes the steps handed over after the end, in order, until there are none."""
+        while True:
+            with self._lock:
+                steps, self._tail = self._tail, []
+                if not steps:
+                    self._cont = None
+                    return
+            for step in steps:
+                try:
+                    step()
+                except Exception:
+                    pass
 
     def run(self) -> None:
         tree = self.tree
@@ -1266,10 +1303,25 @@ class Reaper(threading.Thread):
             self.run()
 
     def join(self, timeout: Optional[float] = None) -> None:
+        """Waits for the reaping and for every step handed over, the ones after its end too. At `timeout` it returns
+        with the rest still running (`finished` says so)."""
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
             super().join(timeout)
         except RuntimeError:               # it was never started: `start` ran it
             pass
+        while True:
+            with self._lock:
+                cont = self._cont
+            if cont is None:
+                return
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return
+            try:
+                cont.join(remaining)
+            except RuntimeError:           # a step waiting for its own thread
+                return
 
 
 _registry_lock = threading.Lock()
