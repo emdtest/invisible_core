@@ -69,13 +69,15 @@ _SENDER = textwrap.dedent("""
     open(marker, "w").write("done")
 """)
 
-#: A process of the browser that is NOT a sender (nothing on its command line says so): it too finishes only when the test says.
+#: A process of the browser that is NOT a sender (nothing on its command line says so): it too finishes only when the test says, and
+#: writes `done` when it has: that is only written by a run that was let go, not by one that was ended.
 _HELD = textwrap.dedent("""
     import os, sys, time
-    started, release = sys.argv[1:3]
+    started, release, marker = sys.argv[1:4]
     open(started, "w").close()
     while not os.path.exists(release):
         time.sleep(0.01)
+    open(marker, "w").write("done")
 """)
 
 #: What stands for the engine. It answers every command on the Juggler pipe (fds 3 and 4 on POSIX, the handles named by
@@ -122,7 +124,8 @@ sender = subprocess.Popen([sys.executable, "-c", @@SENDER@@, path("sender_starte
 print("PIDS", sender.pid, flush=True)
 wait_for("sender_started")
 wait_for("exit_engine")
-late = subprocess.Popen([sys.executable, "-c", @@HELD@@, path("late_started"), path("release_late")])
+late = subprocess.Popen([sys.executable, "-c", @@HELD@@, path("late_started"), path("release_late"),
+                        path("late_marker")])
 print("PIDS", late.pid, flush=True)
 wait_for("late_started")
 print("BYE", flush=True)
@@ -142,6 +145,7 @@ from invisible_core.process import SessionToken, find_processes
 ROOT = os.environ["MARKER_DIR"]
 NET, TICKS = @@NET@@, @@TICKS@@
 INLINE = sys.argv[1] == "inline"
+STUCK = sys.argv[2:] == ["stuck"]
 ENGINE = @@ENGINE@@
 real = {"nt": connection._spawn_windows, "posix": connection._spawn_posix}
 spawn = real["nt" if os.name == "nt" else "posix"]
@@ -156,7 +160,8 @@ connection._spawn_windows = connection._spawn_posix = stand_in
 # Nothing here is let to wait out a bound of the product: the sender finishes when the test says, the browser's exit is waited for
 # as long as the test holds it, and `SENDER_GRACE` is longer than any safety net, so that a reaper that waited for it would hang.
 _profile.SENDER_GRACE = 3600.0
-connection.Connection.close.__defaults__ = (float(NET),)
+if not STUCK:                             # the stuck run keeps the product's own deadline for the browser's exit
+    connection.Connection.close.__defaults__ = (float(NET),)
 if sys.argv[2:] == ["subreaper"]:
     # A client that is the init of its orphans and does not reap them: the PID 1 of a container without one. What the engine
     # leaves behind becomes this process's child and, when it ends, a zombie nobody collects.
@@ -206,9 +211,10 @@ def alive(pids):
 def launch(name):
     folder = os.path.join(ROOT, name)
     os.makedirs(folder, exist_ok=True)
-    if name == "b":                       # the bystander's stand-in holds nothing
+    if name == "b" or STUCK:              # the bystander's stand-in holds nothing; the stuck run's holds only its late child
         for held in ("exit_engine", "release_late", "release_sender"):
-            open(os.path.join(folder, held), "w").close()
+            if not (STUCK and held == "release_late"):
+                open(os.path.join(folder, held), "w").close()
     NEXT[0] = name
     token = SessionToken.mint()
     browser = instance.launch("engine", prefs={"a": True}, env=token.stamp(dict(os.environ)), ready_timeout=NET)
@@ -288,7 +294,8 @@ async def main():
     beat = asyncio.create_task(heartbeat())
     while ticks[0] < TICKS:               # the heartbeat itself works on a free loop: the counts below start from there
         await asyncio.sleep(0)
-    threading.Thread(target=monitor, daemon=True, name="the-monitor").start()
+    if not STUCK:
+        threading.Thread(target=monitor, daemon=True, name="the-monitor").start()
     state["watch"] = True
     if INLINE:
         a.close()                         # the control: the same close, made on the loop itself
@@ -312,6 +319,7 @@ async def main():
         "a_pids": len(pa), "a_alive": alive(pa),
         "a_dirs": [d for d in files_a if os.path.exists(d)],
         "marker_text": open(os.path.join(ROOT, "a", "sender_marker")).read() if here("sender_marker") else None,
+        "late_done": here("late_marker"), "late_released": here("release_late"),
         "zombies": [p for p in pa if status_of(p) == psutil.STATUS_ZOMBIE],
         "b_pids": len(pb), "b_alive": alive(pb),
         "b_dirs": [d for d in (b._files.profile, b._files.tmp) if os.path.exists(d)],
@@ -423,6 +431,16 @@ def subreaped(tmp_path_factory):
     return _drive(tmp_path_factory.mktemp("subreaper"), "aclose", "subreaper")
 
 
+def _drive_stuck(tmp_path):
+    """One run in which a child of the browser (not a sender) is never let go: nothing is held but that child."""
+    run = _Run(tmp_path, "aclose", "stuck")
+    try:
+        run.final = run.expect("REPORT")
+    finally:
+        run.returncode = run.end()
+    return run
+
+
 @pytest.fixture
 def report(run):
     assert run.final, run.why()
@@ -502,6 +520,23 @@ def test_after_close_no_process_of_the_tree_is_alive_and_the_profile_is_gone(rep
     assert report["a_dirs"] == [], "the closed browser left its directories: %s" % report["a_dirs"]
     assert report["marker_text"] == "done", "the sender was ended instead of being let finish: %r" % report
     assert report["token_a_listed"] == 0, "the session's token still lists processes after the close"
+
+
+def test_the_reaper_ends_a_process_of_the_tree_that_never_leaves_by_itself(tmp_path):
+    """A child of the browser that is not a sender and that nothing lets go: the close returns at the product's own deadline for the
+    browser's exit (it does not wait for ever), and the reaper ends the child. Proved by condition, not by time: `await_reaped`
+    returns True (a reaper that waited for the child to leave, or for the sender's grace, would hang until the safety net), and the
+    child is gone without having written the `done` that only a child that was let go writes. The deadline is the product's; the
+    test compares nothing with it."""
+    run = _drive_stuck(tmp_path)
+    assert run.final, run.why()
+    final = run.final
+    assert final["late_released"] is False, "the setup is not the one under test: the child was let go: %r" % final
+    assert final["a_pids"] == 5, "the child was not born: %r" % final
+    assert final["reaped"] is True, "the reaper did not finish while a child of the browser stayed (the safety net)"
+    assert final["a_alive"] == [], "a process of the browser that never left was not ended: %s" % final["a_alive"]
+    assert final["late_done"] is False, "the child finished by itself: it was not ended, so nothing was proved: %r" % final
+    assert final["a_dirs"] == [], "the closed browser left its directories: %s" % final["a_dirs"]
 
 
 def test_closing_one_browser_does_not_touch_the_other(report):
