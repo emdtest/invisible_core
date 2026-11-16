@@ -140,6 +140,7 @@ _CLIENT = r'''
 import asyncio, json, os, sys, threading, time
 import psutil
 from invisible_core.juggler import _profile, connection, instance
+from invisible_core import process as _process
 from invisible_core.process import SessionToken, find_processes
 
 ROOT = os.environ["MARKER_DIR"]
@@ -160,8 +161,10 @@ connection._spawn_windows = connection._spawn_posix = stand_in
 # Nothing here is let to wait out a bound of the product: the sender finishes when the test says, the browser's exit is waited for
 # as long as the test holds it, and `SENDER_GRACE` is longer than any safety net, so that a reaper that waited for it would hang.
 _profile.SENDER_GRACE = 3600.0
-if not STUCK:                             # the stuck run keeps the product's own deadline for the browser's exit
-    connection.Connection.close.__defaults__ = (float(NET),)
+# The limit for the browser's exit (`BROWSER_EXIT_LIMIT`, ONE constant that `close` and its reaper read): the other runs wait as
+# long as the test holds the browser; the stuck run is the one whose child never leaves, so it ends at a short limit of its own
+# instead of the product's 70 s (the safety net of a browser that is stuck, not a measure of anything the test claims).
+_process.BROWSER_EXIT_LIMIT = 2.0 if STUCK else float(NET)
 if sys.argv[2:] == ["subreaper"]:
     # A client that is the init of its orphans and does not reap them: the PID 1 of a container without one. What the engine
     # leaves behind becomes this process's child and, when it ends, a zombie nobody collects.
@@ -523,8 +526,8 @@ def test_after_close_no_process_of_the_tree_is_alive_and_the_profile_is_gone(rep
 
 
 def test_the_reaper_ends_a_process_of_the_tree_that_never_leaves_by_itself(tmp_path):
-    """A child of the browser that is not a sender and that nothing lets go: the close returns at the product's own deadline for the
-    browser's exit (it does not wait for ever), and the reaper ends the child. Proved by condition, not by time: `await_reaped`
+    """A child of the browser that is not a sender and that nothing lets go: the close returns at the limit for the
+    browser's exit (it does not wait for ever; the client shortens the product's limit), and the reaper ends the child. Proved by condition, not by time: `await_reaped`
     returns True (a reaper that waited for the child to leave, or for the sender's grace, would hang until the safety net), and the
     child is gone without having written the `done` that only a child that was let go writes. The deadline is the product's; the
     test compares nothing with it."""

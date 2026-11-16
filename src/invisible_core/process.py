@@ -746,6 +746,18 @@ class EngineJob:
 #: Seconds `EngineTree.release` lets the kernel finish ending a terminated job.
 JOB_END_WAIT = 2.0
 
+#: Seconds a browser that is EXITING is waited for before it is ended: `Connection.close` waits for its real exit, and this is
+#: the one limit of that wait. ⛔ ONE DEFINITION, and it is not a measure of a close: a close
+#: takes 3-7 s on a hosted runner (4 browsers together on Windows: p50 5.83 s, max 6.85 s, all with exit code 0 when the limit was
+#: raised; with 5.0 s, 26 closes of 64 were ended while they were still exiting), and a browser that is exiting is never ended.
+#: This is the net for one that is stuck, and it sits AFTER the moment Firefox brings itself down for a shutdown that does not
+#: finish, not on it: AsyncShutdown crashes the process at `toolkit.asyncshutdown.crash_timeout` (60 s in
+#: `modules/libpref/init/all.js`, on a release build) plus `crash_timeout_additional_wait` (10 s, the terminator's wait on top of
+#: it), so 60 + 10 = 70 s, and 80 s leaves 10 s past it. A browser still alive past this is not exiting, and ending it is
+#: correct. It is the limit of the wait for the exit only: what ends a browser that was ended (`Reaper`) is not a wait for an
+#: exit, and keeps its own 5 s. Every wait on it is on a condition (the exit), so it costs nothing when it exits.
+BROWSER_EXIT_LIMIT = 80.0
+
 #: Seconds between two listings of the tree while an engine on POSIX is
 #: closing (`Connection.close`): a child it makes while it shuts down is in
 #: the next one, and each is one pass over the parents of the processes.
@@ -1194,6 +1206,9 @@ class Reaper(threading.Thread):
     """
 
     def __init__(self, tree: Optional[EngineTree], *, grace: float = 0.0, timeout: float = 5.0) -> None:
+        # `timeout` is what a process that was told to end is given to leave before it is killed: 5.0, for a stray child and
+        # for a browser that `Connection.close` ended at `BROWSER_EXIT_LIMIT` too. Once ended, a browser is not exiting, and
+        # the limit is only for the wait for the exit.
         super().__init__(name="invisible-reaper", daemon=False)
         self.tree = tree
         self.grace = grace
